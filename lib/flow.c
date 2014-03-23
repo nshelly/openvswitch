@@ -39,6 +39,8 @@
 #include "random.h"
 #include "unaligned.h"
 
+VLOG_DEFINE_THIS_MODULE(flow);
+
 COVERAGE_DEFINE(flow_extract);
 COVERAGE_DEFINE(miniflow_malloc);
 
@@ -719,6 +721,65 @@ flow_wildcards_fold_minimask(struct flow_wildcards *wc,
 {
     flow_union_with_miniflow(&wc->masks, &mask->masks);
 }
+
+/* Determine the bits different or common between a flow 'flow' and a rule's
+ * 'match', and fold into 'wc' wildcard mask.
+ *
+ * For header space analysis (HSA), 'wc' keeps track of all
+ * bits that are unique to the packet, and different than all
+ * the rules, in order to install the most general datapath rule possible.*/
+bool
+flow_wildcards_intersect_xor_minimatch(struct flow_wildcards *wc,
+                                       const struct flow *flow,
+                                       const struct minimatch *match,
+                                       uint8_t hsa_offset)
+{
+    bool has_unique = false;
+    uint32_t *wc_u32 = (uint32_t *) &wc->masks;
+    const uint32_t *flow_u32 = (uint32_t *) flow;
+
+    /* Set p_match and p_mask to the start of the values in the miniflow. */
+    uint32_t *p_match = match->flow.values;
+    uint32_t *p_mask = match->mask.masks.values;
+
+    /* Get map of values and mask only of high entropy fields. */
+    unsigned int offset;
+    uint64_t map = miniflow_get_map_in_range(&match->flow, hsa_offset,
+                                             FLOW_U32S, &offset);
+    p_match += offset;
+    miniflow_get_map_in_range(&match->mask.masks, hsa_offset, FLOW_U32S,
+                              &offset);
+    p_mask += offset;
+
+    /* Determine which fields the rule corresponds to and XOR with flow. */
+    for (; map; map = zero_rightmost_1bit(map)) {
+
+        /* If the mask is not set, set the diff wc bit to 1. */
+        //new_bits = *p_mask & ~(wc_u32[raw_ctz(map)]);
+        //if (new_bits) {
+        //    VLOG_DBG("Setting map=%u, wc mask=0x%x, rule mask=0x%x, "
+        //              "new_bits=0x%x", raw_ctz(map), wc_u32[raw_ctz(map)],
+        //              *p_mask, new_bits);
+        //    diff_u32[raw_ctz(map)] |= new_bits;
+        //    VLOG_DBG("after: diff_u32=0x%x", diff_u32[raw_ctz(map)]);
+        //}
+        //wc_u32[raw_ctz(map)] |= *p_mask;
+        //p_mask++;
+
+        VLOG_DBG("wc_u32=x%x <= (flow=0x%x ^ rule=0x%x) & mask=0x%x",
+                  (flow_u32[raw_ctz(map)] ^ *p_match) & *p_mask,
+                  flow_u32[raw_ctz(map)], *p_match, *p_mask);
+
+        /* The diff wc is 1 if the field's value is unique to the flow. */
+        wc_u32[raw_ctz(map)] = (flow_u32[raw_ctz(map)] ^ *p_match++)
+                                & *p_mask++;
+        has_unique = wc_u32[raw_ctz(map)];
+        VLOG_DBG("wc_u32=0x%x", wc_u32[raw_ctz(map)]);
+    }
+    return has_unique;
+}
+
+
 
 uint64_t
 miniflow_get_map_in_range(const struct miniflow *miniflow,

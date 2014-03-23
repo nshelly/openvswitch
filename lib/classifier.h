@@ -245,6 +245,10 @@ enum {
     CLS_MAX_TRIES = 3    /* Maximum number of prefix trees per classifier. */
 };
 
+enum {
+    CLS_HSA_ENTROPY_START = 4 /* Start of high entropy fields. */
+};
+
 /* A flow classifier. */
 struct classifier {
     int n_rules;                /* Total number of rules. */
@@ -258,6 +262,7 @@ struct classifier {
     struct fat_rwlock rwlock OVS_ACQ_AFTER(ofproto_mutex);
     struct cls_trie tries[CLS_MAX_TRIES]; /* Prefix tries. */
     unsigned int n_tries;
+    bool enable_hsa;
 };
 
 /* A set of rules that all have the same fields wildcarded. */
@@ -276,6 +281,11 @@ struct cls_subtable {
     uint8_t index_ofs[CLS_MAX_INDICES]; /* u32 flow segment boundaries. */
     struct hindex indices[CLS_MAX_INDICES]; /* Staged lookup indices. */
     unsigned int trie_plen[CLS_MAX_TRIES];  /* Trie prefix length in 'mask'. */
+
+    bool common_match_initialized; /* Whether common_match is up-to-date. */
+    struct minimatch common_match; /* Wildcards for fields for which all
+                                       rules have the same values. */
+    struct ovs_rwlock common_match_lock;
 };
 
 /* Returns true if 'table' is a "catch-all" subtable that will match every

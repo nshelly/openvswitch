@@ -1,5 +1,6 @@
 bin_PROGRAMS += \
 	utilities/ovs-appctl \
+	utilities/ovs-cls-bench \
 	utilities/ovs-dpctl \
 	utilities/ovs-ofctl \
 	utilities/ovs-vsctl
@@ -98,6 +99,9 @@ dist_man_MANS += utilities/ovs-ctl.8
 
 utilities_ovs_appctl_SOURCES = utilities/ovs-appctl.c
 utilities_ovs_appctl_LDADD = lib/libopenvswitch.la
+
+utilities_ovs_cls_bench_SOURCES = utilities/ovs-cls-bench.c
+utilities_ovs_cls_bench_LDADD = lib/libopenvswitch.la
 
 utilities_ovs_dpctl_SOURCES = utilities/ovs-dpctl.c
 utilities_ovs_dpctl_LDADD = lib/libopenvswitch.la

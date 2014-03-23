@@ -161,7 +161,8 @@ bool minimatch_equal(const struct minimatch *a, const struct minimatch *b);
 uint32_t minimatch_hash(const struct minimatch *, uint32_t basis);
 
 bool minimatch_matches_flow(const struct minimatch *, const struct flow *);
-
+bool minimatch_and_not_xor(struct minimatch *, const struct miniflow *,
+                           uint8_t hsa_offset);
 uint32_t minimatch_hash_range(const struct minimatch *,
                               uint8_t start, uint8_t end, uint32_t *basis);
 

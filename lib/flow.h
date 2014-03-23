@@ -31,6 +31,7 @@ struct dpif_flow_stats;
 struct ds;
 struct flow_wildcards;
 struct minimask;
+struct minimatch;
 struct ofpbuf;
 struct pkt_metadata;
 
@@ -319,6 +320,10 @@ void flow_wildcards_fold_minimask(struct flow_wildcards *,
 void flow_wildcards_fold_minimask_range(struct flow_wildcards *,
                                         const struct minimask *,
                                         uint8_t start, uint8_t end);
+bool flow_wildcards_intersect_xor_minimatch(struct flow_wildcards *,
+                                            const struct flow *,
+                                            const struct minimatch *,
+                                            uint8_t hsa_offset);
 
 uint32_t flow_wildcards_hash(const struct flow_wildcards *, uint32_t basis);
 bool flow_wildcards_equal(const struct flow_wildcards *,

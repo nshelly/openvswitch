@@ -21,6 +21,9 @@
 #include "dynamic-string.h"
 #include "ofp-util.h"
 #include "packets.h"
+#include "vlog.h"
+
+VLOG_DEFINE_THIS_MODULE(match);
 
 /* Converts the flow in 'flow' into a match in 'match', with the given
  * 'wildcards'. */
@@ -1216,6 +1219,50 @@ minimatch_matches_flow(const struct minimatch *match,
 
     return true;
 }
+
+/* Returns true if 'target' has common values with 'match', that is,
+ * if there exist common values at the given mask. It then
+ * updates the common mask to reflect the location of the common values.
+ * A '1' indicates that they share a common value at that location. */
+bool
+minimatch_and_not_xor(struct minimatch *common_match, const struct miniflow *rule,
+                      uint8_t hsa_offset)
+{
+    bool has_common = false;
+    //const uint32_t *rule_u32 = (const uint32_t *) rule;
+
+    /* Set p_match and p_mask to the start of the values in the miniflow. */
+    const uint32_t *common_matchp = common_match->flow.values;
+    uint32_t *common_maskp = common_match->mask.masks.values;
+
+    /* Get map of values and mask only of high entropy fields. */
+    unsigned int offset;
+    uint64_t map = miniflow_get_map_in_range(&common_match->flow, hsa_offset,
+                                             FLOW_U32S, &offset);
+    common_matchp += offset;
+    miniflow_get_map_in_range(&common_match->mask.masks, hsa_offset, FLOW_U32S,
+                              &offset);
+    common_maskp += offset;
+
+    for (; map; map = zero_rightmost_1bit(map)) {
+
+        VLOG_DBG("Setting mask=0x%x to 0x%x, rule=0x%x, common_match=0x%x", 
+                  *common_maskp, *common_maskp & ~(miniflow_get(rule, raw_ctz(map)) ^ *common_matchp),
+                  miniflow_get(rule, raw_ctz(map)), *common_matchp);
+
+        /* Check if values share something in common. */
+        /* For example, ~(10 ^ 11) = 10 so they have Bit 1 in common. */
+        //*common_maskp &= ~(rule_u32[raw_ctz(map)] ^ *common_matchp++);
+        *common_maskp &= ~(miniflow_get(rule, raw_ctz(map)) ^ *common_matchp++);
+        if (*common_maskp++) {
+            has_common = true;
+        }
+    }
+
+    return has_common;
+}
+
+
 
 /* Returns a hash value for the bits of range [start, end) in 'minimatch',
  * given 'basis'.

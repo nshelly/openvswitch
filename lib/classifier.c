@@ -45,9 +45,9 @@ static void update_subtables_after_removal(struct classifier *,
                                            struct cls_subtable *,
                                            unsigned int del_priority);
 
-static struct cls_rule *find_match_wc(const struct cls_subtable *,
+static struct cls_rule *find_match_wc(const struct classifier *,
+                                      struct cls_subtable *,
                                       const struct flow *, struct trie_ctx *,
-                                      unsigned int n_tries,
                                       struct flow_wildcards *);
 static struct cls_rule *find_equal(struct cls_subtable *,
                                    const struct miniflow *, uint32_t hash);
@@ -421,6 +421,9 @@ classifier_remove(struct classifier *cls, struct cls_rule *rule)
 
     subtable = find_subtable(cls, &rule->match.mask);
 
+    /* Need to redo common match calculation. */
+    subtable->common_match_initialized = false;
+
     for (i = 0; i < cls->n_tries; i++) {
         if (subtable->trie_plen[i]) {
             trie_remove(&cls->tries[i], rule, subtable->trie_plen[i]);
@@ -503,6 +506,9 @@ classifier_lookup(const struct classifier *cls, const struct flow *flow,
     struct trie_ctx trie_ctx[CLS_MAX_TRIES];
     int i;
 
+    VLOG_DBG("Classifying flow: %s", flow_to_string(flow));
+    VLOG_DBG("HSA Enabled: %s", cls->enable_hsa ? "True" : "False");
+
     /* Determine 'tags' such that, if 'subtable->tag' doesn't intersect them,
      * then 'flow' cannot possibly match in 'subtable':
      *
@@ -539,22 +545,30 @@ classifier_lookup(const struct classifier *cls, const struct flow *flow,
             continue;
         }
 
-        rule = find_match_wc(subtable, flow, trie_ctx, cls->n_tries, wc);
+        rule = find_match_wc(cls, subtable, flow, trie_ctx, wc);
         if (rule) {
             best = rule;
+            VLOG_DBG("Found rule %s, continuing with subtable search\n",
+                     minimatch_to_string(&(best->match), best->priority));
+
             LIST_FOR_EACH_CONTINUE (subtable, list_node,
                                     &cls->subtables_priority) {
+
+                VLOG_DBG("Looking for higher priority rule, at %d\n",
+                          subtable->max_priority);
+
                 if (subtable->max_priority <= best->priority) {
                     /* Subtables are in descending priority order,
                      * can not find anything better. */
+                    VLOG_DBG("Highest subtable with matching rule %s",
+                             minimatch_to_string(&(best->match), best->priority));
                     return best;
                 }
                 if (!tag_intersects(tags, subtable->tag)) {
                     continue;
                 }
 
-                rule = find_match_wc(subtable, flow, trie_ctx, cls->n_tries,
-                                     wc);
+                rule = find_match_wc(cls, subtable, flow, trie_ctx, wc);
                 if (rule && rule->priority > best->priority) {
                     best = rule;
                 }
@@ -562,6 +576,10 @@ classifier_lookup(const struct classifier *cls, const struct flow *flow,
             break;
         }
     }
+
+    if (best)
+        VLOG_DBG("Returning rule %s",
+                 minimatch_to_string(&(best->match), best->priority));
 
     return best;
 }
@@ -820,6 +838,10 @@ insert_subtable(struct classifier *cls, const struct minimask *mask)
     hmap_init(&subtable->rules);
     minimask_clone(&subtable->mask, mask);
 
+    /* Set common elements to NULL, calculate during flow classification. */
+    subtable->common_match_initialized = false;
+    ovs_rwlock_init(&subtable->common_match_lock);
+
     /* Init indices for segmented lookup, if any. */
     flow_wildcards_init_catchall(&new);
     old = new;
@@ -874,6 +896,7 @@ destroy_subtable(struct classifier *cls, struct cls_subtable *subtable)
     hmap_remove(&cls->subtables, &subtable->hmap_node);
     hmap_destroy(&subtable->rules);
     list_remove(&subtable->list_node);
+    ovs_rwlock_destroy(&subtable->common_match_lock);
     free(subtable);
 }
 
@@ -1037,9 +1060,201 @@ check_tries(struct trie_ctx trie_ctx[CLS_MAX_TRIES], unsigned int n_tries,
     return false;
 }
 
+
+static void
+fold_msb_fields(uint32_t *wc, uint32_t mask) {
+    int tp_src_msb, tp_dst_msb;
+    tp_src_msb = leftmost_1bit_idx(ntohs(mask & 0xff));
+    tp_dst_msb = leftmost_1bit_idx(ntohs(mask >> 16));
+    VLOG_DBG("tp_src mask = 0x%04x, tp_dst mask = 0x%04x",
+             ntohs(mask & 0xff), ntohs(mask >> 16));
+    VLOG_DBG("tp_src_msb = %d, tp_dst_msb= %d", tp_src_msb,
+             tp_dst_msb);
+    /* Pick MSB of either tp_src or tp_dst. */
+    if (tp_src_msb != 32 && tp_src_msb > tp_dst_msb) {
+        *wc |= htons(1 << tp_src_msb);
+    }
+    else if (tp_dst_msb != 32) {
+        *wc |= htons(1 << tp_dst_msb) << 16;
+    }
+    VLOG_DBG("wc is now 0x%08x", *wc);
+}
+
+static void
+fold_hsa_diff_wc(struct cls_subtable *subtable, struct flow_wildcards *wc,
+                 const struct flow *flow)
+{
+    uint8_t hsa_offset = subtable->index_ofs[CLS_HSA_ENTROPY_START-2];
+    uint32_t st_mask = minimask_get(&subtable->mask, hsa_offset);
+    uint32_t *wc_u32 = (uint32_t *) &wc->masks;
+    uint32_t flow_port = ((const uint32_t *) flow)[hsa_offset];
+    //bool has_common_values = true;
+
+    struct cls_rule *rule = NULL;
+    bool need_new;
+    int j, cms_idx;
+    uint32_t folded_mask, folded_val;
+    uint32_t acl_port, cms_val[16], cms_mask[16];
+
+    ovs_rwlock_rdlock(&subtable->common_match_lock);
+    while (!subtable->common_match_initialized) {
+        ovs_rwlock_unlock(&subtable->common_match_lock);
+        ovs_rwlock_wrlock(&subtable->common_match_lock);
+
+        if (!subtable->common_match_initialized) {
+
+            /* Use the first rule for common rule initialization,
+               and the rest in the loop. */
+            ASSIGN_CONTAINER(rule, hmap_first(&subtable->rules),
+                             hmap_node);
+
+            subtable->common_match_initialized = true;
+            minimatch_clone(&subtable->common_match, &rule->match);
+#ifndef NDEBUG
+            VLOG_DBG("At start XOR and intersection, common_match=%s, ",
+                      minimatch_to_string(&subtable->common_match,
+                                          subtable->max_priority));
+#endif
+
+            HMAP_FOR_EACH (rule, hmap_node, &subtable->rules) {
+
+                VLOG_DBG("Subtracting off rule=%s\n",
+                           minimatch_to_string(&rule->match, rule->priority));
+
+                /* Keep track of common values by intersecting with
+                   complement of XOR and new rule. */
+                if(!minimatch_and_not_xor(&subtable->common_match,
+                                          &rule->match.flow, hsa_offset)) {
+                    VLOG_DBG("No common values in subtable.");
+                    //has_common_values = false;
+                    break;
+                }
+                VLOG_DBG("After XOR and intersection, common_match=%s",
+                          minimatch_to_string(&subtable->common_match,
+                                              subtable->max_priority));
+            }
+        }
+        ovs_rwlock_unlock(&subtable->common_match_lock);
+        ovs_rwlock_rdlock(&subtable->common_match_lock);
+    }
+    ovs_rwlock_unlock(&subtable->common_match_lock);
+
+    ovs_rwlock_rdlock(&subtable->common_match_lock);
+    cms_val[0] = miniflow_get(&subtable->common_match.flow, hsa_offset);
+    cms_mask[0] = minimask_get(&subtable->common_match.mask, hsa_offset);
+    ovs_rwlock_unlock(&subtable->common_match_lock);
+
+    VLOG_DBG("Finished common_match=0x%08x/0x%08x, flow_port=0x%08x",
+              cms_val[0], cms_mask[0], flow_port);
+
+    if (st_mask & cms_mask[0] & (cms_val[0] ^ flow_port)) {
+        // Just use MSB of intersection
+        VLOG_DBG("Unique flow to mask! unwildcarding\n");
+        fold_msb_fields(&wc_u32[hsa_offset], cms_mask[0]);
+    }
+    else {
+        /* Find values different from the flow and all of the fields. */
+        for (j=0; j < 16; j++) {
+            cms_val[j] = ~flow_port;
+            cms_mask[j] = st_mask;
+        }
+        cms_idx = 1;
+        //cms_val[cms_idx] = ~flow_port;
+        //cms_mask[cms_idx] = st_mask;
+        VLOG_DBG("Starting with new cms=0x%08x/0x%08x",
+                 cms_val[0], cms_mask[0]);
+
+        HMAP_FOR_EACH (rule, hmap_node, &subtable->rules) {
+            need_new = true;
+            acl_port = miniflow_get(&rule->match.flow, hsa_offset);
+            VLOG_DBG("flow_port=0x%08x, acl_port=%08x, cms_idx=%d",
+                      flow_port, acl_port, cms_idx);
+            for (j=0; j < cms_idx; j++) {
+                // Equivalent to folded
+                folded_mask = cms_mask[j] & ~(cms_val[j] ^ acl_port);
+                folded_val = folded_mask & cms_val[j];
+                if (folded_mask) {
+                    need_new = false;
+                    cms_mask[j] = folded_mask;
+                    cms_val[j] = folded_val;
+                    VLOG_DBG("Updating cms[%d] to 0x%08x/0x%08x",
+                             j, cms_val[j], cms_mask[j]);
+                    break;
+                }
+            }
+
+            if (need_new) {
+                cms_mask[cms_idx] = st_mask & (flow_port ^ acl_port);
+                ovs_assert(cms_mask[cms_idx] == (st_mask & ~(~flow_port ^ acl_port)));
+                cms_val[cms_idx] = cms_mask[cms_idx] & acl_port;
+                /* Must be one different bit, else port == acl. */
+                VLOG_DBG("Adding new cms=0x%08x/0x%08x",
+                         cms_val[cms_idx], cms_mask[cms_idx]);
+                ovs_assert(cms_mask[cms_idx]);
+                cms_idx += 1;
+            }
+        }
+
+        for (j=0; j < cms_idx; j++) {
+            VLOG_DBG("Folding in cms_idx=%d, wc=0x%08x, cms_mask=0x%08x", j,
+                      wc_u32[hsa_offset], cms_mask[j]);
+            if ((wc_u32[hsa_offset] & cms_mask[j]) == 0) {
+                fold_msb_fields(&wc_u32[hsa_offset], cms_mask[j]);
+            }
+            else {
+                VLOG_DBG("not folding: 0x%08x", 
+                         wc_u32[hsa_offset] & cms_mask[j]);
+            }
+        }
+    }
+        //match_init(&match_wc_str, flow, &diff_wc);
+        //VLOG_DBG("after diff_wc=%s\n",
+        //          match_to_string(&match_wc_str, subtable->max_priority));
+
+        /* Fold the most significant bit of the unique fields of the flow
+         * into the wildcard. */
+//        valid_hsa = false;
+//        if (diff_wc.masks.tp_src) {
+//            msb = leftmost_1bit_idx(ntohs(diff_wc.masks.tp_src));
+//            VLOG_DBG("tp_src: field: value=0x%X, msb=%d",
+//                     ntohs(diff_wc.masks.tp_src), msb);
+//            if (msb > 0) {
+//                wc->masks.tp_src |= (ovs_be16) htons(1 << msb);
+//                valid_hsa = true;
+//            }
+//        }
+//
+//        if (!valid_hsa && diff_wc.masks.tp_dst) {
+//            msb = leftmost_1bit_idx(ntohs(diff_wc.masks.tp_dst));
+//            VLOG_DBG("tp_dst: field: value=0x%X, msb=%d",
+//                      ntohs(diff_wc.masks.tp_dst), msb);
+//            if (msb > 0) {
+//                wc->masks.tp_dst |= (ovs_be16) htons(1 << msb);
+//                valid_hsa = true;
+//            }
+//        }
+//        match_init(&match_wc_str, flow, wc);
+//        VLOG_DBG("after wc=%s\n",
+//                  match_to_string(&match_wc_str, subtable->max_priority));
+//
+//        if (!valid_hsa) {
+//            /* There's no single bit that all the rules have in common and not
+//               in the flow. */
+//            flow_wildcards_fold_minimask(wc, &subtable->mask);
+//        }
+//    }
+//    else {
+//        /* No common values, just unwildcard all of the subtable's mask. */
+//        VLOG_DBG("No HSA bit available, using full wc\n");
+//        flow_wildcards_fold_minimask(wc, &subtable->mask);
+//    }
+}
+
+/* Subtract off higher rules for HSA. The match "hsa_diff" maintains
+   the flow's unique bits (that do not match higher priority rules). */
 static inline struct cls_rule *
-find_match(const struct cls_subtable *subtable, const struct flow *flow,
-           uint32_t hash)
+find_match(const struct classifier *cls, struct cls_subtable *subtable,
+           const struct flow *flow, uint32_t hash, struct flow_wildcards *wc)
 {
     struct cls_rule *rule;
 
@@ -1049,12 +1264,18 @@ find_match(const struct cls_subtable *subtable, const struct flow *flow,
         }
     }
 
+    /* No matching rule found, subtract off rules (HSA mode). */
+    if (wc && cls->enable_hsa) {
+        fold_hsa_diff_wc(subtable, wc, flow);
+    }
+
     return NULL;
 }
 
 static struct cls_rule *
-find_match_wc(const struct cls_subtable *subtable, const struct flow *flow,
-              struct trie_ctx trie_ctx[CLS_MAX_TRIES], unsigned int n_tries,
+find_match_wc(const struct classifier *cls,
+              struct cls_subtable *subtable, const struct flow *flow,
+              struct trie_ctx trie_ctx[CLS_MAX_TRIES],
               struct flow_wildcards *wc)
 {
     uint32_t basis = 0, hash;
@@ -1063,8 +1284,8 @@ find_match_wc(const struct cls_subtable *subtable, const struct flow *flow,
     struct range ofs;
 
     if (!wc) {
-        return find_match(subtable, flow,
-                          flow_hash_in_minimask(flow, &subtable->mask, 0));
+        return find_match(cls, subtable, flow,
+                          flow_hash_in_minimask(flow, &subtable->mask, 0), wc);
     }
 
     ofs.start = 0;
@@ -1073,7 +1294,7 @@ find_match_wc(const struct cls_subtable *subtable, const struct flow *flow,
         struct hindex_node *inode;
         ofs.end = subtable->index_ofs[i];
 
-        if (check_tries(trie_ctx, n_tries, subtable->trie_plen, ofs, flow,
+        if (check_tries(trie_ctx, cls->n_tries, subtable->trie_plen, ofs, flow,
                         wc)) {
             goto range_out;
         }
@@ -1086,6 +1307,7 @@ find_match_wc(const struct cls_subtable *subtable, const struct flow *flow,
              * covered so far. */
             goto range_out;
         }
+        VLOG_DBG("Match in Layer %d", i+1);
 
         /* If we have narrowed down to a single rule already, check whether
          * that rule matches.  If it does match, then we're done.  If it does
@@ -1100,30 +1322,42 @@ find_match_wc(const struct cls_subtable *subtable, const struct flow *flow,
          * (Rare) hash collisions may cause us to miss the opportunity for this
          * optimization. */
         if (!inode->s && !rule) {
+            VLOG_DBG("Checking if single rule matches.");
             ASSIGN_CONTAINER(rule, inode - i, index_nodes);
             if (minimatch_matches_flow(&rule->match, flow)) {
+                VLOG_DBG("Single rule that matches flow: %s",
+                          minimatch_to_string(&rule->match, rule->priority));
                 goto out;
             }
         }
     }
     ofs.end = FLOW_U32S;
     /* Trie check for the final range. */
-    if (check_tries(trie_ctx, n_tries, subtable->trie_plen, ofs, flow, wc)) {
+    if (check_tries(trie_ctx, cls->n_tries, subtable->trie_plen, ofs,
+                    flow, wc)) {
         goto range_out;
     }
     if (!rule) {
         /* Multiple potential matches exist, look for one. */
         hash = flow_hash_in_minimask_range(flow, &subtable->mask, ofs.start,
                                            ofs.end, &basis);
-        rule = find_match(subtable, flow, hash);
+        VLOG_DBG("Checking multiple matches or subtracting in index=%d", i);
+        rule = find_match(cls, subtable, flow, hash,
+                          cls->enable_hsa ? wc : NULL);
     } else {
         /* We already narrowed the matching candidates down to just 'rule',
          * but it didn't match. */
         rule = NULL;
     }
  out:
-    /* Must unwildcard all the fields, as they were looked at. */
-    flow_wildcards_fold_minimask(wc, &subtable->mask);
+    if (!rule && cls->enable_hsa) {
+        /* Only fold up to segment before HSA takes over. */
+        flow_wildcards_fold_minimask_range(wc, &subtable->mask, 0, ofs.start);
+    }
+    else {
+        /* Must unwildcard all the fields, as they were looked at. */
+        flow_wildcards_fold_minimask(wc, &subtable->mask);
+    }
     return rule;
 
  range_out:
