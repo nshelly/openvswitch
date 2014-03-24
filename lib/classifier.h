@@ -285,7 +285,7 @@ struct cls_subtable {
     bool common_match_initialized; /* Whether common_match is up-to-date. */
     struct minimatch common_match; /* Wildcards for fields for which all
                                        rules have the same values. */
-    struct ovs_rwlock common_match_lock;
+    struct fat_rwlock common_match_lock;
 };
 
 /* Returns true if 'table' is a "catch-all" subtable that will match every

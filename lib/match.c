@@ -1246,9 +1246,9 @@ minimatch_and_not_xor(struct minimatch *common_match, const struct miniflow *rul
 
     for (; map; map = zero_rightmost_1bit(map)) {
 
-        VLOG_DBG("Setting mask=0x%x to 0x%x, rule=0x%x, common_match=0x%x", 
-                  *common_maskp, *common_maskp & ~(miniflow_get(rule, raw_ctz(map)) ^ *common_matchp),
-                  miniflow_get(rule, raw_ctz(map)), *common_matchp);
+        //VLOG_DBG("Setting mask=0x%x to 0x%x, rule=0x%x, common_match=0x%x", 
+        //          *common_maskp, *common_maskp & ~(miniflow_get(rule, raw_ctz(map)) ^ *common_matchp),
+        //          miniflow_get(rule, raw_ctz(map)), *common_matchp);
 
         /* Check if values share something in common. */
         /* For example, ~(10 ^ 11) = 10 so they have Bit 1 in common. */
