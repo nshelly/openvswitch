@@ -574,9 +574,9 @@ classifier_lookup(const struct classifier *cls, const struct flow *flow,
         }
     }
 
-    if (best)
-        VLOG_DBG("Returning rule %s",
-                 minimatch_to_string(&(best->match), best->priority));
+    //if (best)
+    //    VLOG_DBG("Returning rule %s",
+    //             minimatch_to_string(&(best->match), best->priority));
 
     return best;
 }
@@ -1180,7 +1180,7 @@ fold_hsa_diff_wc(struct cls_subtable *subtable, struct flow_wildcards *wc,
                 //VLOG_DBG("Adding new cms=0x%08x/0x%08x",
                 //         cms_val[cms_idx], cms_mask[cms_idx]);
                 ovs_assert(cms_mask[cms_idx] == (st_mask & ~(~flow_port ^ acl_port)));
-                ovs_assert(cms_mask[cms_idx]);
+                //ovs_assert(cms_mask[cms_idx]);
                 cms_idx += 1;
             }
         }

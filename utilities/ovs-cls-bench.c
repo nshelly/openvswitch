@@ -85,7 +85,7 @@ main(int argc, char *argv[])
 
 static void
 usage(void) {
-    printf("%s [hsa | decision_tree | standard] <flow_file>\n", program_name);
+    printf("%s [hsa | standard] <flow_file>\n", program_name);
     exit(EXIT_SUCCESS);
 }
 
@@ -107,23 +107,20 @@ benchmark(struct classifier *cls)
     fat_rwlock_rdlock(&cls->rwlock);
     clock_gettime(CLOCK_MONOTONIC_RAW, &before);
     getrusage(RUSAGE_SELF, &rbefore);
-    //for (i = 0; i < 10000000; i++) {
-    for (i = 0; i < 5; i++) {
+    for (i = 0; i < 10000000; i++) {
         eth_addr_random(flow.dl_src);
         eth_addr_random(flow.dl_dst);
         flow.nw_src = htonl(random_uint32());
         flow.nw_dst = htonl(random_uint32());
         flow.tp_src = htons(random_uint16());
-        //flow.tp_dst = htons(random_uint16());
-        flow.tp_dst = htons(998+i);
+        flow.tp_dst = htons(random_uint16());
+        flow.tp_dst = htons(i);
         flow_wildcards_init_catchall(&wc);
-        //VLOG_DBG("Finding relevant wc's for flow=%s\n",
-        //         flow_to_string(flow));
-        VLOG_DBG("Finding relevant wc's for flow: tp_dst=%d (0x%04x)",
-                 ntohs(flow.tp_dst), ntohs(flow.tp_dst));
+        //VLOG_DBG("Finding relevant wc's for flow: tp_dst=%d (0x%04x)",
+        //         ntohs(flow.tp_dst), ntohs(flow.tp_dst));
         classifier_lookup(cls, &flow, &wc);
         match_init(&match_wc_str, &flow, &wc);
-        VLOG_DBG("Relevant fields: %s", match_to_string(&match_wc_str, 0));
+        //VLOG_DBG("Relevant fields: %s", match_to_string(&match_wc_str, 0));
     }
     getrusage(RUSAGE_SELF, &rafter);
     clock_gettime(CLOCK_MONOTONIC_RAW, &after);
